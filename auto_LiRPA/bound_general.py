@@ -74,9 +74,9 @@ class BoundedModule(nn.Module):
         # Default options.
         default_bound_opts = {
             'conv_mode': 'patches',
-            'sparse_intermediate_bounds': True,
-            'sparse_conv_intermediate_bounds': True,
-            'sparse_intermediate_bounds_with_ibp': True,
+            'sparse_intermediate_bounds': False,
+            'sparse_conv_intermediate_bounds': False,
+            'sparse_intermediate_bounds_with_ibp': False,
             'sparse_features_alpha': True,
             'sparse_spec_alpha': True,
             'minimum_sparsity': 0.9,
