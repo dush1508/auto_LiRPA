@@ -48,6 +48,10 @@ from torch.nn import Sequential
 from onnx import numpy_helper
 
 from parse_args import parse_args, DEFAULT_NETS_DIR, DEFAULT_TINYIMAGENET_DIR
+#FEAT: bound_opts for every BoundedModule; --sparse fills it in __main__.
+BOUND_OPTS = {}
+#FEAT: inference BatchNormalization is folded into its Conv at load time.
+from onnx_preprocess import expand_maxpool, fold_batch_norm
 
 
 # # Check if the path was added successfully
@@ -289,10 +293,14 @@ def parse_onnx_layers(net):
     values = _LazyArrays(net.graph.initializer)
     # Create the new Network object
     layers = Network(input_name=net.graph.input[0].name, input_shape=input_shape)
-    num_layers = len(net.graph.node) 
     #FEAT: float weights follow the run dtype.
     model_name_to_val_dict = {init_vals.name: _default_float(torch.tensor(numpy_helper.to_array(init_vals))) for init_vals in
                               net.graph.initializer}
+    #FEAT: fold BN before the layer walk (the identity fallback below used to drop it silently).
+    net, model_name_to_val_dict = fold_batch_norm(net, model_name_to_val_dict)
+    #FEAT: 2x2/stride-2 MaxPool as Conv/Relu/Add, Dropout as Identity (VNN-COMP vggnet16).
+    net, model_name_to_val_dict = expand_maxpool(net, model_name_to_val_dict)
+    num_layers = len(net.graph.node)
 
     names_hash = dict()
     index = 0
@@ -541,34 +549,9 @@ def get_dataset(batch_size: int, dataset: str, train: bool = False):
         transform = transforms.ToTensor()  # keep 32x32
         data = datasets.CIFAR10(root=".", train=train, download=True, transform=transform)
     elif dataset == "tinyimagenet":
-        train = True
-        transform = transforms.Compose([
-            transforms.Resize((64, 64)),  # TinyImageNet images are 64x64
-            transforms.ToTensor(),
-        ])
-        root_dir = DEFAULT_TINYIMAGENET_DIR
-        split = "train" if train else "test"
-        data_dir = os.path.join(root_dir, split)
-        if train:
-            data = datasets.ImageFolder(root=data_dir, transform=transform)
-        else:
-            # TinyImageNet test: all images in one folder
-            from torchvision.datasets.folder import default_loader
-            class TinyImageNetTest(torch.utils.data.Dataset):
-                def __init__(self, root, transform=None):
-                    self.root = root
-                    self.transform = transform
-                    self.loader = default_loader
-                    self.images = sorted(os.listdir(root))
-                def __len__(self):
-                    return len(self.images)
-                def __getitem__(self, idx):
-                    path = os.path.join(self.root, self.images[idx])
-                    img = self.loader(path)
-                    if self.transform:
-                        img = self.transform(img)
-                    return img, -1
-            data = TinyImageNetTest(data_dir, transform=transform)
+        #FIX FOR: TinyImageNet came from the unlabeled-order train split with a top-left crop; the benchmark verifies the labeled val split, center-cropped.
+        from tinyimagenet import TinyImageNetValidation
+        data = TinyImageNetValidation(DEFAULT_TINYIMAGENET_DIR)
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -621,9 +604,12 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
         #FEAT: images follow the run dtype instead of hardcoded fp32.
         image = image.to(torch.get_default_dtype()) / 255.0
     else:
-        image = image[:, :, :56, :56]
-        #FEAT: images follow the run dtype instead of hardcoded fp32.
-        image = image.to(torch.get_default_dtype()) / 255.0
+        #FIX FOR: TinyImageNet pixels were divided by 255 a second time (ToTensor already gives [0, 1]).
+        image = image.to(torch.get_default_dtype())
+        #FIX FOR: TinyImageNet was normalized with the CIFAR-10 mean/std; the non-MNIST path below reads these two.
+        import tinyimagenet
+        cifar10_mean = torch.tensor(tinyimagenet.MEAN).reshape(1, -1, 1, 1)
+        cifar10_std = torch.tensor(tinyimagenet.STD).reshape(1, -1, 1, 1)
     # Images stay on the host; each run moves only its own batch, as the other harnesses do.
     IMG_ALL = image
     LABEL_ALL = true_label
@@ -670,7 +656,7 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
         with torch.no_grad():
             model = get_pytorch_from_onnx(onnx_file)
             perturb_model_(model, perturb_eps, perturb_rng)
-            lirpa_model = BoundedModule(model, original_image, device=image.device)
+            lirpa_model = BoundedModule(model, original_image, device=image.device, bound_opts=BOUND_OPTS)
             lb, ub = lirpa_model.compute_bounds(x=(image,), method=program, C=C)
 
         if device == 'cuda':
@@ -739,7 +725,7 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
         with torch.no_grad():
             model = get_pytorch_from_onnx(onnx_file)
             perturb_model_(model, perturb_eps, perturb_rng)
-            lirpa_model = BoundedModule(model, original_image, device=image.device)
+            lirpa_model = BoundedModule(model, original_image, device=image.device, bound_opts=BOUND_OPTS)
             lb, ub = lirpa_model.compute_bounds(x=(image,), method=program, C=C)
 
         if device == 'cuda':
@@ -817,7 +803,7 @@ def _certify_batch(IMG_ALL, LABEL_ALL, lo, N, onnx_file, eps, dataset, mnist, pr
 
     with torch.no_grad():
         model = get_pytorch_from_onnx(onnx_file)
-        lirpa_model = BoundedModule(model, original_image, device=image.device)
+        lirpa_model = BoundedModule(model, original_image, device=image.device, bound_opts=BOUND_OPTS)
         lb, ub = lirpa_model.compute_bounds(x=(image,), method=program, C=C)
 
     if device == 'cuda':
@@ -909,6 +895,10 @@ if __name__ == '__main__':
 
     if args.logs != 'stdout':
         sys.stdout = open(args.logs, 'w')
+    if args.sparse:
+        BOUND_OPTS.update(sparse_intermediate_bounds=True, sparse_conv_intermediate_bounds=True,
+                          sparse_intermediate_bounds_with_ibp=True)
+    print(f'bound_opts: {BOUND_OPTS}')
 
     if args.program == 'deeppoly':
         program = 'backward'

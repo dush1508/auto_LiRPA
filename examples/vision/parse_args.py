@@ -62,6 +62,8 @@ def parse_args():
     parser.add_argument('--dtype', choices=['float32', 'float64'], default='float32', help='float64 computes every float tensor in fp64 (a precision oracle for bound mismatches).')
     #FEAT: --profile_comm records CPU-GPU communication per timed batch (comm_profile.py).
     parser.add_argument('--profile_comm', action='store_true', help='With --num_images: profile each timed batch with torch.profiler and add syncs, alloc_syncs, gpu_idle_pct and sync_calls to its results line; its time goes to profiled_time_s instead of time_s. Warmups are not profiled.')
+    #FEAT: --sparse turns on auto_LiRPA's sparse intermediate bounds (only unstable neurons are bounded).
+    parser.add_argument('--sparse', action='store_true', help='auto_LiRPA sparse_intermediate_bounds, sparse_conv_intermediate_bounds and sparse_intermediate_bounds_with_ibp (default off).')
 
 
     args = parser.parse_args()
