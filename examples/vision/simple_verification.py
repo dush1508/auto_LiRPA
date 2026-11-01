@@ -6,6 +6,7 @@ This example serves as a skeleton for robustness verification of neural networks
 import sys
 import os
 import gc
+import faulthandler
 
 
 DISABLE_TF32 = os.environ.get("CF_DISABLE_TF32", "0") not in ("", "0")
@@ -563,7 +564,7 @@ def get_dataset(batch_size: int, dataset: str, train: bool = False):
         label = torch.tensor(label)
     return image, label
 
-def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', nets_dir=DEFAULT_NETS_DIR, device='cpu', warmup=0, repeat=1, perturb_eps=0.0, perturb_seed=0, num_images=0, results_file=None, profile_comm=False):
+def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', nets_dir=DEFAULT_NETS_DIR, device='cpu', warmup=0, repeat=1, perturb_eps=0.0, perturb_seed=0, num_images=0, results_file=None, profile_comm=False, batch_timeout=0.0):
     import numpy as np
     perturb_rng = np.random.default_rng(perturb_seed) if perturb_eps > 0 else None
     mnist = dataset == "mnist"
@@ -617,10 +618,10 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
     if num_images:
         return _run_image_batches(IMG_ALL, LABEL_ALL, onnx_file, N, eps, dataset, mnist, program,
                                   device, warmup, num_images, results_file,
-                                  mnist_mean, mnist_std, cifar10_mean, cifar10_std, profile_comm)
+                                  mnist_mean, mnist_std, cifar10_mean, cifar10_std, profile_comm, batch_timeout)
 
     for i in range(warmup):
-        warmup_start = time.time()
+        warmup_start = time.perf_counter()
         IMG = IMG_ALL[(i + 1) * N : (i + 2) * N].to(device)
         true_label = LABEL_ALL[(i + 1) * N : (i + 2) * N].to(device)
 
@@ -661,7 +662,7 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
 
         if device == 'cuda':
             torch.cuda.synchronize()
-        print(f'Warmup run {i + 1}/{warmup}: {time.time() - warmup_start} s')
+        print(f'Warmup run {i + 1}/{warmup}: {time.perf_counter() - warmup_start} s')
         ### Free Memory ####
         lb, ub = lb.detach().cpu(), ub.detach().cpu()
         del lirpa_model, model, lb, ub
@@ -688,7 +689,7 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
             resident = torch.cuda.memory_allocated()
-        start_time = time.time()
+        start_time = time.perf_counter()
         # This run's input box and spec are built inside the timer, as in the other harnesses.
         IMG = IMG_ALL[:N].to(device)
         true_label = LABEL_ALL[:N].to(device)
@@ -730,7 +731,7 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
 
         if device == 'cuda':
             torch.cuda.synchronize()
-        run_time = time.time() - start_time
+        run_time = time.perf_counter() - start_time
         run_peak = torch.cuda.max_memory_allocated() if device == 'cuda' else None
         run_times.append(run_time)
         run_peaks.append(run_peak)
@@ -813,7 +814,7 @@ def _certify_batch(IMG_ALL, LABEL_ALL, lo, N, onnx_file, eps, dataset, mnist, pr
 
 def _run_image_batches(IMG_ALL, LABEL_ALL, onnx_file, N, eps, dataset, mnist, program, device,
                        warmup, num_images, results_file,
-                       mnist_mean, mnist_std, cifar10_mean, cifar10_std, profile_comm=False):
+                       mnist_mean, mnist_std, cifar10_mean, cifar10_std, profile_comm=False, batch_timeout=0.0):
     """The --num_images protocol: warmups on the images after the evaluated ones, then one
     timed run per batch, each writing one JSON line after its timer stops. No error
     handling: a failing batch kills the process, and finished batches stay in the file."""
@@ -831,9 +832,9 @@ def _run_image_batches(IMG_ALL, LABEL_ALL, onnx_file, N, eps, dataset, mnist, pr
     with open(results_file, "w") as out:
         for j in range(warmup):
             lo = num_images + j * N
-            warmup_start = time.time()
+            warmup_start = time.perf_counter()
             lb, ub = _certify_batch(IMG_ALL, LABEL_ALL, lo, N, *args)
-            warmup_time = time.time() - warmup_start
+            warmup_time = time.perf_counter() - warmup_start
             print(f'Warmup run {j + 1}/{warmup}: {warmup_time} s')
             write(out, {"kind": "warmup", "index": j, "images": [lo, lo + N], "time_s": warmup_time})
             del lb, ub
@@ -855,11 +856,14 @@ def _run_image_batches(IMG_ALL, LABEL_ALL, onnx_file, N, eps, dataset, mnist, pr
                     torch.cuda.synchronize()
                     torch.cuda.reset_peak_memory_stats()
                     resident = torch.cuda.memory_allocated()
-                start_time = time.time()
+                if batch_timeout:
+                    faulthandler.dump_traceback_later(batch_timeout, exit=True)
+                start_time = time.perf_counter()
                 # This run's input box and spec are built inside the timer, as in the other harnesses.
                 with comm.region():
                     lb, ub = _certify_batch(IMG_ALL, LABEL_ALL, lo, N, *args)
-                run_time = time.time() - start_time
+                run_time = time.perf_counter() - start_time
+                faulthandler.cancel_dump_traceback_later()
             # Per-run peaks exist only on the GPU; a CPU process's peak RSS is lifetime-wide.
             peak = torch.cuda.max_memory_allocated() if device == 'cuda' else None
 
@@ -922,7 +926,7 @@ if __name__ == '__main__':
             raise ValueError("--num_images must be a positive multiple of --batch_size and needs --results_file")
         if args.profile_comm and not args.num_images:
             raise ValueError("--profile_comm requires --num_images")
-        run_exp(f'{args.network}.{args.network_format}', args.batch_size, args.eps, dataset = args.dataset, program=program, nets_dir=args.nets_dir, device=torch_device, warmup=args.warmup, repeat=args.repeat, num_images=args.num_images, results_file=args.results_file, profile_comm=args.profile_comm)
+        run_exp(f'{args.network}.{args.network_format}', args.batch_size, args.eps, dataset = args.dataset, program=program, nets_dir=args.nets_dir, device=torch_device, warmup=args.warmup, repeat=args.repeat, num_images=args.num_images, results_file=args.results_file, profile_comm=args.profile_comm, batch_timeout=args.batch_timeout)
     else:
         if args.exp_name == 'eran':
             if args.dataset == 'mnist':
