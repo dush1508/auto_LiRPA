@@ -7,6 +7,7 @@ import sys
 import os
 import gc
 import faulthandler
+import functools
 
 
 DISABLE_TF32 = os.environ.get("CF_DISABLE_TF32", "0") not in ("", "0")
@@ -41,9 +42,10 @@ from enum import Enum
 import torch.nn
 from torch.nn import Module
 from torch.nn import Conv2d
+from torch.nn import MaxPool2d  #FEAT: native MaxPool (auto_LiRPA's BoundMaxPool)
 from torch.nn import Linear
 from torch.nn import ReLU
-from torch.nn import Sigmoid
+from torch.nn import Sigmoid, Tanh
 from torch.nn import Flatten
 from torch.nn import Sequential
 from onnx import numpy_helper
@@ -52,7 +54,7 @@ from parse_args import parse_args, DEFAULT_NETS_DIR, DEFAULT_TINYIMAGENET_DIR
 #FEAT: bound_opts for every BoundedModule; --sparse fills it in __main__.
 BOUND_OPTS = {}
 #FEAT: inference BatchNormalization is folded into its Conv at load time.
-from onnx_preprocess import expand_maxpool, fold_batch_norm
+from onnx_preprocess import fold_batch_norm
 
 
 # # Check if the path was added successfully
@@ -98,6 +100,8 @@ class LayerType(Enum):
     Add = 10
     Input = 11
     Reshape = 12
+    Tanh = 13
+    MaxPool2D = 14
 
 class Add(torch.nn.Module):
     def forward(self, x1, x2):
@@ -153,10 +157,14 @@ class TransformedNet(Module):
                 constructed_layers.append(ReLU())
             elif layer.type == LayerType.Sigmoid:
                 constructed_layers.append(Sigmoid())
+            elif layer.type == LayerType.Tanh:
+                constructed_layers.append(Tanh())
             elif layer.type == LayerType.Flatten:
                 constructed_layers.append(Flatten(start_dim=1))
             elif layer.type == LayerType.Reshape:
                 constructed_layers.append(Reshape(layer.shape))
+            elif layer.type == LayerType.MaxPool2D:
+                constructed_layers.append(MaxPool2d(layer.kernel_size, stride=layer.stride, padding=layer.padding))
             elif layer.type == LayerType.Concat:
                 constructed_layers.append(None)
                 self.concat_layers[layer.identifier] = layer.parents
@@ -299,8 +307,7 @@ def parse_onnx_layers(net):
                               net.graph.initializer}
     #FEAT: fold BN before the layer walk (the identity fallback below used to drop it silently).
     net, model_name_to_val_dict = fold_batch_norm(net, model_name_to_val_dict)
-    #FEAT: 2x2/stride-2 MaxPool as Conv/Relu/Add, Dropout as Identity (VNN-COMP vggnet16).
-    net, model_name_to_val_dict = expand_maxpool(net, model_name_to_val_dict)
+    #FEAT: MaxPool stays a MaxPool (auto_LiRPA bounds it with its own BoundMaxPool); Dropout passes through below.
     num_layers = len(net.graph.node)
 
     names_hash = dict()
@@ -310,6 +317,7 @@ def parse_onnx_layers(net):
 
     layer = Layer(type=LayerType.Input, parents = [])
     layers.append(layer)
+    normalization = {i.name for i in net.graph.input}  # the network input and its normalization steps
     for cur_layer in range(num_layers):
         node = net.graph.node[cur_layer]
         operation = node.op_type
@@ -400,12 +408,14 @@ def parse_onnx_layers(net):
             final_relu = True
             layers.append(Layer(type=LayerType.ReLU, identifier=index, parents=parents[index]))
 
-        elif operation == 'Sigmoid':
+        #FEAT: Tanh, as Sigmoid (ERAN tanh networks).
+        elif operation in ('Sigmoid', 'Tanh'):
             shapes[node.output[0]] = shapes[nd_inps[0]]
             names_hash[str(net.graph.node[cur_layer].output[0])] = index
             parents[index] = [names_hash[str(net.graph.node[cur_layer].input[0])]]
 
-            layers.append(Layer(type=LayerType.Sigmoid, identifier=index, parents=parents[index]))
+            layers.append(Layer(type=LayerType.Sigmoid if operation == 'Sigmoid' else LayerType.Tanh,
+                                identifier=index, parents=parents[index]))
 
         elif operation == 'Concat':
             if len(nd_inps) != 2 or not all(name in names_hash for name in nd_inps):
@@ -425,6 +435,23 @@ def parse_onnx_layers(net):
             result_shape = list(shapes[nd_inps[0]])
             result_shape[axis] += shapes[nd_inps[1]][axis]
             shapes[node.output[0]] = result_shape
+
+        #FEAT: native MaxPool, as auto_LiRPA's own ONNX loader keeps it.
+        elif operation == 'MaxPool':
+            attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
+            kernel, strides = list(attrs['kernel_shape']), list(attrs.get('strides', attrs['kernel_shape']))
+            pads = list(attrs.get('pads', [0, 0, 0, 0]))
+            if (len(kernel) != 2 or pads[:2] != pads[2:] or attrs.get('ceil_mode', 0)
+                    or any(d != 1 for d in attrs.get('dilations', [1, 1]))):
+                raise ValueError(f"Unsupported MaxPool {node.name!r}: {attrs}")
+            names_hash[node.output[0]] = index
+            parents[index] = [names_hash[nd_inps[0]]]
+            layer = Layer(type=LayerType.MaxPool2D, identifier=index, parents=parents[index])
+            layer.kernel_size, layer.stride, layer.padding = tuple(kernel), tuple(strides), tuple(pads[:2])
+            n, c, h, w = shapes[nd_inps[0]]
+            shapes[node.output[0]] = [n, c, (h + 2 * pads[0] - kernel[0]) // strides[0] + 1,
+                                      (w + 2 * pads[1] - kernel[1]) // strides[1] + 1]
+            layers.append(layer)
 
         elif operation == 'Flatten':
             axis = next((a.i for a in node.attribute if a.name == 'axis'), 1)
@@ -455,6 +482,13 @@ def parse_onnx_layers(net):
                 layer.bias = layer.bias + model_name_to_val_dict[nd_inps[1]]
 
         else:
+            #FIX FOR: every other op was taken as identity, so e.g. Tanh networks were verified without their Tanh.
+            #         Only no-op layers and the input normalization (Sub/Div/Mul on the network input; the harness
+            #         normalizes itself) may pass through.
+            if operation in ('Sub', 'Div', 'Mul') and nd_inps[0] in normalization:
+                normalization.add(node.output[0])
+            elif operation not in ('Constant', 'Dropout', 'Identity'):
+                raise ValueError(f'unsupported ONNX op {operation}')
             index -= 1
             if len(net.graph.node[cur_layer].input)>0:
                 if str(net.graph.node[cur_layer].input[0]) in names_hash:
@@ -564,7 +598,15 @@ def get_dataset(batch_size: int, dataset: str, train: bool = False):
         label = torch.tensor(label)
     return image, label
 
-def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', nets_dir=DEFAULT_NETS_DIR, device='cpu', warmup=0, repeat=1, perturb_eps=0.0, perturb_seed=0, num_images=0, results_file=None, profile_comm=False, batch_timeout=0.0):
+#FEAT: 'vnnlib:<npz>' datasets: VNN-COMP specs stacked by the harness (input box lo/hi, margin rows C y + d > 0).
+@functools.lru_cache(maxsize=None)
+def vnnlib_specs(path):
+    import numpy as np
+    with np.load(path) as f:
+        return {k: torch.from_numpy(f[k]) for k in ('lo', 'hi', 'C', 'd', 'x_shape')}
+
+
+def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', nets_dir=DEFAULT_NETS_DIR, device='cpu', warmup=0, repeat=1, perturb_eps=0.0, perturb_seed=0, num_images=0, results_file=None, profile_comm=False, batch_timeout=0.0, warmup_timeout=0.0):
     import numpy as np
     perturb_rng = np.random.default_rng(perturb_seed) if perturb_eps > 0 else None
     mnist = dataset == "mnist"
@@ -595,13 +637,30 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
         true_label = test_data.targets[:total]
         true_label = torch.tensor(true_label)
         image = torch.from_numpy(test_data.data[:total]).permute(0, 3, 1, 2).view(-1, 3, 32, 32)
+    #FEAT: CIFAR-100 test set (CIFAR100_TinyImageNet_ResNet benchmark), its own normalizer.
+    elif dataset == "cifar100":
+        onnx_file = os.path.join(folder, 'cifar100', onnx_file)
+        test_data = torchvision.datasets.CIFAR100('./data', train=False, download=True, transform=torchvision.transforms.ToTensor())
+        true_label = torch.tensor(test_data.targets[:total])
+        image = torch.from_numpy(test_data.data[:total]).permute(0, 3, 1, 2).view(-1, 3, 32, 32)
+        cifar10_mean = torch.tensor([0.5071, 0.4865, 0.4409]).reshape(1, -1, 1, 1)
+        cifar10_std = torch.tensor([0.2673, 0.2564, 0.2761]).reshape(1, -1, 1, 1)
     elif dataset == "tinyimagenet":
         onnx_file = os.path.join(folder, onnx_file)
         image, true_label = get_dataset(total, dataset, train=True)
         # image = image[:, :, :56, :56]
+    elif dataset.startswith("vnnlib:"):
+        # image i is spec i mod #specs as [lo, hi]; its label is that spec's index
+        onnx_file = os.path.join(folder, onnx_file)
+        specs = vnnlib_specs(dataset[len("vnnlib:"):])
+        true_label = torch.arange(total) % specs['lo'].shape[0]
+        image = torch.stack([specs['lo'][true_label], specs['hi'][true_label]], 1)
+        image = image.reshape(total, 2, *specs['x_shape'].tolist())
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
-    if dataset != 'tinyimagenet':
+    if dataset.startswith("vnnlib:"):
+        image = image.to(torch.get_default_dtype())
+    elif dataset != 'tinyimagenet':
         #FEAT: images follow the run dtype instead of hardcoded fp32.
         image = image.to(torch.get_default_dtype()) / 255.0
     else:
@@ -618,7 +677,7 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
     if num_images:
         return _run_image_batches(IMG_ALL, LABEL_ALL, onnx_file, N, eps, dataset, mnist, program,
                                   device, warmup, num_images, results_file,
-                                  mnist_mean, mnist_std, cifar10_mean, cifar10_std, profile_comm, batch_timeout)
+                                  mnist_mean, mnist_std, cifar10_mean, cifar10_std, profile_comm, batch_timeout, warmup_timeout)
 
     for i in range(warmup):
         warmup_start = time.perf_counter()
@@ -650,6 +709,8 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
 
         if dataset == 'tinyimagenet':
             num_classes = 200
+        elif dataset == 'cifar100':
+            num_classes = 100
         else:
             num_classes = 10
         C = get_spec_matrix(image, true_label, num_classes)
@@ -719,6 +780,8 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
 
         if dataset == 'tinyimagenet':
             num_classes = 200
+        elif dataset == 'cifar100':
+            num_classes = 100
         else:
             num_classes = 10
         C = get_spec_matrix(image, true_label, num_classes)
@@ -772,6 +835,8 @@ def _certify_batch(IMG_ALL, LABEL_ALL, lo, N, onnx_file, eps, dataset, mnist, pr
     """One run of the timed region, as in run_exp's --repeat loop, on images [lo, lo + N)."""
     IMG = IMG_ALL[lo : lo + N].to(device)
     true_label = LABEL_ALL[lo : lo + N].to(device)
+    if dataset.startswith("vnnlib:"):
+        return _certify_vnnlib_batch(IMG, true_label, onnx_file, dataset, program)
 
     original_image = copy.deepcopy(IMG)
 
@@ -798,6 +863,8 @@ def _certify_batch(IMG_ALL, LABEL_ALL, lo, N, onnx_file, eps, dataset, mnist, pr
 
     if dataset == 'tinyimagenet':
         num_classes = 200
+    elif dataset == 'cifar100':
+        num_classes = 100
     else:
         num_classes = 10
     C = get_spec_matrix(image, true_label, num_classes)
@@ -812,9 +879,28 @@ def _certify_batch(IMG_ALL, LABEL_ALL, lo, N, onnx_file, eps, dataset, mnist, pr
     return lb, ub
 
 
+def _certify_vnnlib_batch(IMG, spec_idx, onnx_file, dataset, program):
+    """A VNN-COMP spec batch: the box is the spec's own, the margin rows its C y + d."""
+    specs = vnnlib_specs(dataset[len("vnnlib:"):])
+    x_L, x_U = IMG[:, 0], IMG[:, 1]
+    center = (x_L + x_U) / 2
+    idx = spec_idx.cpu()
+    C = specs['C'][idx].to(IMG)
+    d = specs['d'][idx].to(IMG)
+    image = BoundedTensor(center, PerturbationLpNorm(norm=float("inf"), x_L=x_L, x_U=x_U))
+    with torch.no_grad():
+        model = get_pytorch_from_onnx(onnx_file)
+        lirpa_model = BoundedModule(model, center, device=IMG.device, bound_opts=BOUND_OPTS)
+        lb, ub = lirpa_model.compute_bounds(x=(image,), method=program, C=C)
+    if IMG.is_cuda:
+        torch.cuda.synchronize()
+    return lb + d, ub + d
+
+
 def _run_image_batches(IMG_ALL, LABEL_ALL, onnx_file, N, eps, dataset, mnist, program, device,
                        warmup, num_images, results_file,
-                       mnist_mean, mnist_std, cifar10_mean, cifar10_std, profile_comm=False, batch_timeout=0.0):
+                       mnist_mean, mnist_std, cifar10_mean, cifar10_std, profile_comm=False, batch_timeout=0.0,
+                       warmup_timeout=0.0):
     """The --num_images protocol: warmups on the images after the evaluated ones, then one
     timed run per batch, each writing one JSON line after its timer stops. No error
     handling: a failing batch kills the process, and finished batches stay in the file."""
@@ -832,9 +918,12 @@ def _run_image_batches(IMG_ALL, LABEL_ALL, onnx_file, N, eps, dataset, mnist, pr
     with open(results_file, "w") as out:
         for j in range(warmup):
             lo = num_images + j * N
+            if warmup_timeout:
+                faulthandler.dump_traceback_later(warmup_timeout, exit=True)
             warmup_start = time.perf_counter()
             lb, ub = _certify_batch(IMG_ALL, LABEL_ALL, lo, N, *args)
             warmup_time = time.perf_counter() - warmup_start
+            faulthandler.cancel_dump_traceback_later()
             print(f'Warmup run {j + 1}/{warmup}: {warmup_time} s')
             write(out, {"kind": "warmup", "index": j, "images": [lo, lo + N], "time_s": warmup_time})
             del lb, ub
@@ -926,7 +1015,7 @@ if __name__ == '__main__':
             raise ValueError("--num_images must be a positive multiple of --batch_size and needs --results_file")
         if args.profile_comm and not args.num_images:
             raise ValueError("--profile_comm requires --num_images")
-        run_exp(f'{args.network}.{args.network_format}', args.batch_size, args.eps, dataset = args.dataset, program=program, nets_dir=args.nets_dir, device=torch_device, warmup=args.warmup, repeat=args.repeat, num_images=args.num_images, results_file=args.results_file, profile_comm=args.profile_comm, batch_timeout=args.batch_timeout)
+        run_exp(f'{args.network}.{args.network_format}', args.batch_size, args.eps, dataset = args.dataset, program=program, nets_dir=args.nets_dir, device=torch_device, warmup=args.warmup, repeat=args.repeat, num_images=args.num_images, results_file=args.results_file, profile_comm=args.profile_comm, batch_timeout=args.batch_timeout, warmup_timeout=args.warmup_timeout)
     else:
         if args.exp_name == 'eran':
             if args.dataset == 'mnist':

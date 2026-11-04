@@ -63,8 +63,10 @@ def parse_args():
     #FEAT: --profile_comm records CPU-GPU communication per timed batch (comm_profile.py).
     parser.add_argument('--profile_comm', action='store_true', help='With --num_images: profile each timed batch with torch.profiler and add syncs, alloc_syncs, gpu_idle_pct and sync_calls to its results line; its time goes to profiled_time_s instead of time_s. Warmups are not profiled.')
     #FEAT: --sparse turns on auto_LiRPA's sparse intermediate bounds (only unstable neurons are bounded).
-    #FEAT: per-batch time limit (warmups are never limited).
-    parser.add_argument('--batch_timeout', type=float, default=0.0, help="With --num_images: end the process if one timed batch runs longer than this many seconds (faulthandler prints 'Timeout' and every thread's stack). Warmups have no limit. 0: no limit.")
+    #FEAT: per-batch time limit.
+    parser.add_argument('--batch_timeout', type=float, default=0.0, help="With --num_images: end the process if one timed batch runs longer than this many seconds (faulthandler prints 'Timeout' and every thread's stack). Warmups: --warmup_timeout. 0: no limit.")
+    #FEAT: per-warmup time limit.
+    parser.add_argument('--warmup_timeout', type=float, default=0.0, help="With --num_images: end the process if one warmup run takes longer than this many seconds (faulthandler prints 'Timeout' and every thread's stack). 0: no limit.")
     parser.add_argument('--sparse', action='store_true', help='auto_LiRPA sparse_intermediate_bounds, sparse_conv_intermediate_bounds and sparse_intermediate_bounds_with_ibp (default off).')
 
 
