@@ -598,12 +598,14 @@ def get_dataset(batch_size: int, dataset: str, train: bool = False):
         label = torch.tensor(label)
     return image, label
 
-#FEAT: 'vnnlib:<npz>' datasets: VNN-COMP specs stacked by the harness (input box lo/hi, margin rows C y + d > 0).
-@functools.lru_cache(maxsize=None)
-def vnnlib_specs(path):
-    import numpy as np
-    with np.load(path) as f:
-        return {k: torch.from_numpy(f[k]) for k in ('lo', 'hi', 'C', 'd', 'x_shape')}
+#FEAT: 'vnnlib:<benchmark folder>' datasets: VNN-COMP specs, each batch's parsed inside the timed run.
+def vnnlib_specs():
+    """bench/vnnlib_specs.py of the harness repo (spec list, input shape, parser)."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    if repo not in sys.path:
+        sys.path.append(repo)  # appended: the repo root holds constraintflow/, auto_LiRPA/ checkouts
+    from bench import vnnlib_specs
+    return vnnlib_specs
 
 
 def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', nets_dir=DEFAULT_NETS_DIR, device='cpu', warmup=0, repeat=1, perturb_eps=0.0, perturb_seed=0, num_images=0, results_file=None, profile_comm=False, batch_timeout=0.0, warmup_timeout=0.0):
@@ -650,12 +652,12 @@ def run_exp(onnx_file, N=1, eps = 0.01, dataset="mnist", program='backward', net
         image, true_label = get_dataset(total, dataset, train=True)
         # image = image[:, :, :56, :56]
     elif dataset.startswith("vnnlib:"):
-        # image i is spec i mod #specs as [lo, hi]; its label is that spec's index
+        # image i is spec i mod #specs; its label is that spec's index. The image is a placeholder [lo, hi] box:
+        # each run parses its specs (_certify_vnnlib_batch).
         onnx_file = os.path.join(folder, onnx_file)
-        specs = vnnlib_specs(dataset[len("vnnlib:"):])
-        true_label = torch.arange(total) % specs['lo'].shape[0]
-        image = torch.stack([specs['lo'][true_label], specs['hi'][true_label]], 1)
-        image = image.reshape(total, 2, *specs['x_shape'].tolist())
+        specs, bench = vnnlib_specs(), dataset[len("vnnlib:"):]
+        true_label = torch.arange(total) % len(specs.spec_files(bench))
+        image = torch.zeros(total, 2, *specs.input_shape(bench))
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
     if dataset.startswith("vnnlib:"):
@@ -880,13 +882,12 @@ def _certify_batch(IMG_ALL, LABEL_ALL, lo, N, onnx_file, eps, dataset, mnist, pr
 
 
 def _certify_vnnlib_batch(IMG, spec_idx, onnx_file, dataset, program):
-    """A VNN-COMP spec batch: the box is the spec's own, the margin rows its C y + d."""
-    specs = vnnlib_specs(dataset[len("vnnlib:"):])
-    x_L, x_U = IMG[:, 0], IMG[:, 1]
+    """A VNN-COMP spec batch, parsed here: the box is the spec's own, the margin rows its C y + d."""
+    lo, hi, C, d = vnnlib_specs().read_batch(dataset[len("vnnlib:"):], spec_idx.tolist())
+    as_img = lambda a: torch.from_numpy(a).to(IMG)
+    x_L, x_U = as_img(lo).reshape(IMG[:, 0].shape), as_img(hi).reshape(IMG[:, 1].shape)
     center = (x_L + x_U) / 2
-    idx = spec_idx.cpu()
-    C = specs['C'][idx].to(IMG)
-    d = specs['d'][idx].to(IMG)
+    C, d = as_img(C), as_img(d)
     image = BoundedTensor(center, PerturbationLpNorm(norm=float("inf"), x_L=x_L, x_U=x_U))
     with torch.no_grad():
         model = get_pytorch_from_onnx(onnx_file)
